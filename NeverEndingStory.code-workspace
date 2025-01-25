@@ -1,0 +1,24 @@
+{
+        "folders": [
+        {
+            "name": "Contracts",
+            "path": "./contracts"
+        },
+        {
+            "name": "Frontend",
+            "path": "./frontend"
+        },
+        {
+            "name": "Server",
+            "path": "./server"
+        }
+    ],
+    "settings": {
+        "mochaExplorer.files": ["test/**/*.js"],
+        "mochaExplorer.require": ["hardhat/register"],
+        "mochaExplorer.cwd": "${workspaceFolder:Contracts}",
+        "files.exclude": {
+            "**/node_modules": true
+        }
+    }
+}

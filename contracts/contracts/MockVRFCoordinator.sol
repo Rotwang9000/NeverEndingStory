@@ -6,6 +6,9 @@ contract MockVRFCoordinator {
     uint256 public requestCounter;
     uint256 public mockRandomNumber = 12345;
     
+    // Track requests by requestId
+    mapping(uint256 => address) public consumers;
+    
     event RandomWordsRequested(
         uint256 indexed requestId,
         address indexed consumer
@@ -13,7 +16,19 @@ contract MockVRFCoordinator {
 
     event RandomWordsFulfilled(
         uint256 indexed requestId,
-        uint256[] randomWords
+        uint256[] randomWords,
+        address consumer
+    );
+    
+    event DebugCallback(
+        bool success,
+        bytes data
+    );
+
+    event DebugFulfill(
+        uint256 requestId,
+        address consumer,
+        uint256[] words
     );
     
     function requestRandomWords(
@@ -23,20 +38,39 @@ contract MockVRFCoordinator {
         uint32,  // callbackGasLimit
         uint32   // numWords
     ) external returns (uint256) {
+        uint256 currentId = requestId;
         requestCounter++;
-        emit RandomWordsRequested(requestId, msg.sender);
-        return requestId++;
+        consumers[currentId] = msg.sender;
+        emit RandomWordsRequested(currentId, msg.sender);
+        requestId++;
+        return currentId;
     }
 
     function fulfillRandomWords(uint256 _requestId, address consumer) external {
-        uint256[] memory randomWords = new uint256[](1);
-        randomWords[0] = mockRandomNumber;
+        require(consumers[_requestId] == consumer, "Consumer mismatch");
         
-        emit RandomWordsFulfilled(_requestId, randomWords);
-        VRFConsumerBaseV2(consumer).rawFulfillRandomWords(_requestId, randomWords);
+        uint256[] memory words = _getRandomWords();
+        
+        // Emit debug event
+        emit DebugFulfill(_requestId, consumer, words);
+
+        // First emit standard event
+        emit RandomWordsRequested(_requestId, consumer);
+        
+        // Direct call instead of try-catch for better error visibility
+        VRFConsumerBaseV2(consumer).rawFulfillRandomWords(_requestId, words);
+        
+        // If we get here, it succeeded
+        emit RandomWordsFulfilled(_requestId, words, consumer);
+        delete consumers[_requestId];
     }
 
-    // Test helper to set the mock random number
+    function _getRandomWords() internal view returns (uint256[] memory) {
+        uint256[] memory randomWords = new uint256[](1);
+        randomWords[0] = mockRandomNumber;
+        return randomWords;
+    }
+
     function setMockRandomNumber(uint256 _mockRandomNumber) external {
         mockRandomNumber = _mockRandomNumber;
     }

@@ -2,6 +2,7 @@
 pragma solidity ^0.8.17;
 
 import "./RandomnessConsumer.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 
 /*
    Multi-prompt voting, unstoppable time-based rounds,
@@ -9,7 +10,7 @@ import "./RandomnessConsumer.sol";
    plus a "shout out" message board with a small fee.
 */
 
-contract MultiPromptStory is RandomnessConsumer {
+contract NeverEndingStory is RandomnessConsumer, ReentrancyGuard {
 	enum RoundState { SUBMISSION, VOTING, ENDED }
 
 	struct Prompt {
@@ -31,6 +32,8 @@ contract MultiPromptStory is RandomnessConsumer {
 		uint256 votingEndTime;
 		uint256[] promptIds;  // which prompt IDs belong to this round
 		bool finalized;
+		uint256 submissions;         // how many prompts submitted so far
+		uint256 totalVotingAmount;   // how much ETH has been voted so far
 	}
 
 	// We'll store each prompt and each round
@@ -67,6 +70,21 @@ contract MultiPromptStory is RandomnessConsumer {
 	}
 	Shout[] public shouts;
 
+	// Add new state variables for tracking random voter requests
+	mapping(uint256 => uint256) public pendingRandomVoterPromptId;
+	mapping(uint256 => address) public pendingRandomVoterWinner;
+
+	// Add these state variables after the existing state variables
+	struct PendingReward {
+		address recipient;
+		uint256 amount;
+	}
+	mapping(uint256 => PendingReward[]) public pendingRewards;
+
+	// Add new state variables for limiting submissions and voting
+	uint256 public maxSubmissions;
+	uint256 public maxVotingAmount;
+
 	// Events
 	event PromptSubmitted(uint256 indexed roundId, uint256 promptId, address indexed creator, string text);
 	event VoteCast(uint256 indexed roundId, uint256 indexed promptId, address voter, uint256 amount);
@@ -75,36 +93,87 @@ contract MultiPromptStory is RandomnessConsumer {
 	event PotDistribution(address indexed winner, uint256 amount);
 	event ShoutOut(address indexed sender, string message, uint256 feePaid);
 
-	constructor(uint64 _subscriptionId) RandomnessConsumer(_subscriptionId) {
-		COORDINATOR = VRFCoordinatorV2Interface(vrfCoordinator);
-		subscriptionId = _subscriptionId;
-		owner = msg.sender;
-		_startNewRound();
-		lastActionTime = block.timestamp;
-	}
+	// Add new events for debugging
+	event TransferFailed(address recipient, uint256 amount);
+	event TransferSucceeded(address recipient, uint256 amount);
+
+	// Add new debug events
+	event DebugTransfer(
+		string action,
+		address to,
+		uint256 amount,
+		uint256 currentPot
+	);
+
+	// Add a new event for high gas transfers
+	event HighGasTransfer(address to, uint256 amount);
+
+	// Add new event for round count debugging
+	event DebugCount(string msg, uint256 count);
+
+	// Add new debug events
+	event DebugPot(string msg, uint256 amount);
+	event DebugAddress(string msg, address addr);
+
+	event DebugBalance(string msg, uint256 balance, uint256 pot);
+
+	// Add event for tracking funds
+	event FundsTracking(
+		string action,
+		uint256 amount,
+		uint256 pot,
+		uint256 balance
+	);
+
+	constructor(uint64 _subscriptionId, address _coordinator) 
+        RandomnessConsumer(_subscriptionId, _coordinator) 
+    {
+        owner = msg.sender;
+        _startNewRound();
+        lastActionTime = block.timestamp;
+    }
 
 	modifier onlyOwner() {
 		require(msg.sender == owner, "Not the owner");
 		_;
 	}
 
+	// Add this function after the constructor
+	function setVRFCoordinator(address _coordinator) external onlyOwner {
+		_setVRFCoordinator(_coordinator);
+	}
+
+	// Add setter functions for these limits
+	function setMaxSubmissions(uint256 _maxSubmissions) external onlyOwner {
+		maxSubmissions = _maxSubmissions;
+	}
+
+	function setMaxVotingAmount(uint256 _maxVotingAmount) external onlyOwner {
+		maxVotingAmount = _maxVotingAmount;
+	}
+
+	// Add transferOwnership function
+	function transferOwnership(address newOwner) external onlyOwner {
+		owner = newOwner;
+	}
+
 	// ---------------------------------
 	// ROUND LOGIC
 	// ---------------------------------
 
-	function submitPrompt(string memory _text) external payable {
+	function submitPrompt(string memory _text) external payable nonReentrant {
 		RoundData storage round = rounds[currentRoundId];
 		require(round.state == RoundState.SUBMISSION, "Not submission phase");
 		require(block.timestamp < round.submissionEndTime, "Submission time ended");
 		require(msg.value > 0, "Must send ETH with prompt");
 
-		// Dev fee
-		uint256 devCut = (msg.value * DEV_FEE_PERCENT) / 100;
-		payable(owner).transfer(devCut);
+		 // Enforce maximum submissions if set
+        if (maxSubmissions > 0) {
+            require(round.submissions < maxSubmissions, "Max number of submissions reached");
+        }
 
-		// The rest goes to pot
-		uint256 leftover = msg.value - devCut;
-		pot += leftover;
+		// Handle fees first
+		_handlePromptFees(msg.value);
 
 		// Create prompt
 		uint256 pid = nextPromptId++;
@@ -114,9 +183,25 @@ contract MultiPromptStory is RandomnessConsumer {
 		p.exists = true;
 
 		round.promptIds.push(pid);
+		round.submissions++;
+
+		// Apply submission ETH as a vote on its own prompt
+		// Enforce maxVotingAmount if set
+		if (maxVotingAmount > 0) {
+			require(round.totalVotingAmount + msg.value <= maxVotingAmount, "Max voting limit reached");
+		}
+		p.totalVotes += msg.value;
+		if (p.votesByAddress[msg.sender] == 0) {
+			p.voters.push(msg.sender);
+		}
+		p.votesByAddress[msg.sender] += msg.value;
+		if (p.votesByAddress[msg.sender] > p.topVoterAmount) {
+			p.topVoterAmount = p.votesByAddress[msg.sender];
+			p.topVoter = msg.sender;
+		}
+		round.totalVotingAmount += msg.value;
 
 		emit PromptSubmitted(currentRoundId, pid, msg.sender, _text);
-
 		lastActionTime = block.timestamp;
 	}
 
@@ -130,44 +215,51 @@ contract MultiPromptStory is RandomnessConsumer {
 		lastActionTime = block.timestamp;
 	}
 
-	function voteOnPrompt(uint256 _promptId) external payable {
-		RoundData storage round = rounds[currentRoundId];
-		require(round.state == RoundState.VOTING, "Not in voting phase");
-		require(block.timestamp < round.votingEndTime, "Voting ended");
-		require(msg.value > 0, "Must send ETH to vote");
-		require(prompts[_promptId].exists, "Prompt doesn't exist");
-		// Also check if the prompt is part of this round? 
-		// (We skip the check for brevity, but you'd do it in production.)
+    function voteOnPrompt(uint256 _promptId) external payable nonReentrant {
+        // Validation first
+        RoundData storage round = rounds[currentRoundId];
+        require(round.state == RoundState.VOTING, "Not in voting phase");
+        require(block.timestamp < round.votingEndTime, "Voting ended");
+        require(msg.value > 0, "Must send ETH to vote");
+        require(prompts[_promptId].exists, "Prompt doesn't exist");
 
-		// Dev fee
-		uint256 devCut = (msg.value * DEV_FEE_PERCENT) / 100;
-		payable(owner).transfer(devCut);
+        // Update state before external calls
+        Prompt storage p = prompts[_promptId];
+        p.totalVotes += msg.value;
+        round.totalVotingAmount += msg.value;
 
-		// Remainder to pot
-		uint256 leftover = msg.value - devCut;
-		pot += leftover;
+        if (p.votesByAddress[msg.sender] == 0) {
+            p.voters.push(msg.sender);
+        }
+        p.votesByAddress[msg.sender] += msg.value;
 
-		// Tally vote
-		Prompt storage p = prompts[_promptId];
-		p.totalVotes += msg.value;
+        if (p.votesByAddress[msg.sender] > p.topVoterAmount) {
+            p.topVoterAmount = p.votesByAddress[msg.sender];
+            p.topVoter = msg.sender;
+        }
 
-		if (p.votesByAddress[msg.sender] == 0) {
-			p.voters.push(msg.sender);
-		}
-		p.votesByAddress[msg.sender] += msg.value;
+        // Calculate fees
+        uint256 devCut = (msg.value * DEV_FEE_PERCENT) / 100;
+        uint256 leftover = msg.value - devCut;
+        pot += leftover;
 
-		// update top voter if needed
-		if (p.votesByAddress[msg.sender] > p.topVoterAmount) {
-			p.topVoterAmount = p.votesByAddress[msg.sender];
-			p.topVoter = msg.sender;
-		}
+        // External call last, but capture revert reason:
+        (bool success, bytes memory data) = payable(owner).call{value: devCut}("");
+        if (!success) {
+            if (data.length > 0) {
+                assembly {
+                    revert(add(32, data), mload(data))
+                }
+            } else {
+                revert("Dev fee transfer failed");
+            }
+        }
 
-		emit VoteCast(currentRoundId, _promptId, msg.sender, msg.value);
+        emit VoteCast(currentRoundId, _promptId, msg.sender, msg.value);
+        lastActionTime = block.timestamp;
+    }
 
-		lastActionTime = block.timestamp;
-	}
-
-	function finalizeRound() external {
+	function finalizeRound() external nonReentrant {
 		RoundData storage round = rounds[currentRoundId];
 		require(round.state == RoundState.VOTING, "Not in voting phase");
 		require(block.timestamp >= round.votingEndTime, "Voting not ended");
@@ -176,56 +268,67 @@ contract MultiPromptStory is RandomnessConsumer {
 		round.finalized = true;
 		round.state = RoundState.ENDED;
 
-		// pick winner = highest totalVotes among round.promptIds
 		uint256 winningPromptId = _findWinningPromptId(round.promptIds);
-
 		Prompt storage winner = prompts[winningPromptId];
 
-		// Distribute from winner’s total votes if you want a partial immediate reward:
-		// e.g. 30% to winner creator, 15% to top bidder, 5% random among voters, 50% to pot
-		// We'll do it quickly here for demonstration:
-		uint256 winningTotal = winner.totalVotes;
-		if (winningTotal > 0) {
-			uint256 creatorShare = (winningTotal * 30) / 100;
-			uint256 topBidderShare = (winningTotal * 15) / 100;
-			uint256 randomBidderShare = (winningTotal * 5) / 100;
-			uint256 leftoverToPot = winningTotal - (creatorShare + topBidderShare + randomBidderShare);
+		if (winner.totalVotes > 0) {
+			// Calculate shares
+			uint256 totalVotes = winner.totalVotes;
+			uint256 creatorShare = (totalVotes * 30) / 100;
+			uint256 topBidderShare = (totalVotes * 15) / 100;
+			uint256 randomBidderShare = (totalVotes * 5) / 100;
 
-			payable(winner.creator).transfer(creatorShare);
-			if (winner.topVoter != address(0)) {
+			// Sync pot before transfers
+			_syncPotWithBalance();
+
+			// Send immediate rewards
+			if (creatorShare > 0) {
+				payable(winner.creator).transfer(creatorShare);
+				_syncPotWithBalance();
+			}
+
+			if (topBidderShare > 0 && winner.topVoter != address(0)) {
 				payable(winner.topVoter).transfer(topBidderShare);
+				_syncPotWithBalance();
 			}
-			address randomVoter = _pickRandomVoter(winningPromptId);
-			if (randomVoter != address(0)) {
-				payable(randomVoter).transfer(randomBidderShare);
+
+			// Handle random voter reward if any
+			if (randomBidderShare > 0) {
+				uint256 requestId = _pickRandomVoter(winningPromptId);
+				if (requestId > 0) {
+					pendingRewards[requestId].push(PendingReward({
+						recipient: address(0),
+						amount: randomBidderShare
+					}));
+				}
 			}
-			pot += leftoverToPot;
 		}
 
-		emit RoundFinalized(currentRoundId, winningPromptId, winner.text);
-
-		// record the new "round winner"
+		// Update winners list
 		roundCount++;
 		lastHundredWinners.push(winner.creator);
 		if (lastHundredWinners.length > 100) {
 			_popFront(lastHundredWinners);
 		}
 
-		// check if we do random distribution
-		if (roundCount % 100 == 0) {
-			_distributePotRandomly();
+		emit RoundFinalized(currentRoundId, winningPromptId, winner.text);
+		
+		// Random pot distribution check
+		if (roundCount >= 100) {
+			emit DebugCount("distributing pot at count", roundCount);
+			uint256 currentBalance = address(this).balance;
+			if (currentBalance > 0) {
+				_distributePotRandomly();
+			}
 		}
 
-		// start a new round automatically or wait for user to do so
-		// We'll do it automatically for convenience
 		_startNewRound();
-
 		lastActionTime = block.timestamp;
 	}
 
 	// If no new round activity for a day, anyone can call
 	// to distribute the pot randomly among last 100 winners
-	function distributeIdlePot() external {
+	function distributeIdlePot() external nonReentrant {
 		require(block.timestamp >= lastActionTime + IDLE_DURATION, "Not enough idle time");
 		require(pot > 0, "Nothing in pot");
 		_distributePotRandomly();
@@ -301,37 +404,77 @@ contract MultiPromptStory is RandomnessConsumer {
 	}
 
 	function _distributePotRandomly() internal {
-		if (lastHundredWinners.length == 0) {
-			return;
-		}
+		if (lastHundredWinners.length == 0) return;
+		
+		 // Sync before distribution
+        _syncPotWithBalance();
+        
+        if (pot == 0) return;
+		
+		emit DebugCount("requesting random for distribution", pot);
 		requestRandomness();
 	}
 
 	// Remove the old _pseudoRandomIndex function and replace with VRF callback
 	function fulfillRandomWords(uint256 requestId, uint256[] memory randomWords) internal override {
-		require(pendingRandomDistribution[requestId], "No pending request");
-		
+		// Ensure pot is in sync with balance
+        rebalancePot();
+        
 		uint256 randomResult = randomWords[0];
 		
-		if (lastHundredWinners.length > 0) {
-			uint256 winnerIndex = randomResult % lastHundredWinners.length;
-			address lucky = lastHundredWinners[winnerIndex];
-			
-			uint256 potToSend = pot;
-			pot = 0;
-			
-			payable(lucky).transfer(potToSend);
-			emit PotDistribution(lucky, potToSend);
-		}
+		emit DebugCount("fulfilling random", requestId);
 		
-		delete pendingRandomDistribution[requestId];
+		// Handle pot distribution
+		if (pendingRandomDistribution[requestId]) {
+			emit DebugCount("handling pot distribution", pot);
+			
+			if (lastHundredWinners.length > 0) {
+				uint256 winnerIndex = randomResult % lastHundredWinners.length;
+				address lucky = lastHundredWinners[winnerIndex];
+				emit DebugAddress("lucky winner", lucky);
+				
+				uint256 potToSend = pot;
+				pot = 0;
+				(bool success,) = payable(lucky).call{value: potToSend}("");
+				if (!success) {
+					pot = potToSend;
+				} else {
+					roundCount = 0;
+				}
+			}
+			
+			delete pendingRandomDistribution[requestId];
+		}
+		// Handle random voter selection
+		else if (pendingRandomVoterPromptId[requestId] > 0) {
+			uint256 promptId = pendingRandomVoterPromptId[requestId];
+			Prompt storage p = prompts[promptId];
+			
+			if (p.voters.length > 0) {
+				uint256 randIndex = randomResult % p.voters.length;
+				address voter = p.voters[randIndex];
+				
+				// Process any pending rewards
+				PendingReward[] storage rewards = pendingRewards[requestId];
+				for (uint256 i = 0; i < rewards.length; i++) {
+					if (rewards[i].amount > 0) {
+						_safeTransfer(voter, rewards[i].amount);
+					}
+				}
+				delete pendingRewards[requestId];
+			}
+			
+			delete pendingRandomVoterPromptId[requestId];
+		}
 	}
 
-	function _pickRandomVoter(uint256 promptId) internal returns (address) {
+	// Update _pickRandomVoter to return requestId
+	function _pickRandomVoter(uint256 promptId) internal returns (uint256) {
 		Prompt storage p = prompts[promptId];
 		if (p.voters.length == 0) {
-			return address(0);
+			return 0;
 		}
+		
 		uint256 requestId = COORDINATOR.requestRandomWords(
 			keyHash,
 			subscriptionId,
@@ -339,8 +482,9 @@ contract MultiPromptStory is RandomnessConsumer {
 			callbackGasLimit,
 			numWords
 		);
-		uint256 randIndex = requestId % p.voters.length;
-		return p.voters[randIndex];
+		
+		pendingRandomVoterPromptId[requestId] = promptId;
+		return requestId;
 	}
 
 	function _popFront(address[] storage arr) internal {
@@ -351,9 +495,97 @@ contract MultiPromptStory is RandomnessConsumer {
 		arr.pop();
 	}
 
-
-	// fallback to accept direct ETH (added to pot)
-	receive() external payable {
-		pot += msg.value;
+	// Simplify safe transfer - just use what's available
+	function _safeTransfer(address to, uint256 amount) internal returns (bool) {
+		if (to == address(0) || amount == 0) return false;
+		
+		 // Sync before transfer
+        _syncPotWithBalance();
+        
+        // Only transfer what's actually available
+        uint256 actualAmount = amount > pot ? pot : amount;
+        if (actualAmount == 0) return false;
+        
+        // Update pot first
+        pot -= actualAmount;
+		
+		(bool success, ) = payable(to).call{value: actualAmount}("");
+		
+		if (!success) {
+			pot += actualAmount;  // Restore on failure
+			emit TransferFailed(to, actualAmount);
+			return false;
+		}
+		
+		emit TransferSucceeded(to, actualAmount);
+		return true;
 	}
+
+	// Add function to verify pot matches balance
+    function verifyPotBalance() public view returns (bool) {
+        return pot <= address(this).balance;
+    }
+
+	// Add view function for testing
+    function getLastHundredWinnersLength() external view returns (uint256) {
+        return lastHundredWinners.length;
+    }
+
+	// Simplified receive function - no pot tracking needed
+    receive() external payable {
+        // Just accept the payment
+    }
+
+	// Add function to fix pot if it gets out of sync
+    function emergencyResetPot() external onlyOwner {
+        pot = address(this).balance;
+    }
+
+	// Add pot rebalancing function
+    function rebalancePot() public {
+        uint256 balance = address(this).balance;
+        if (pot > balance) {
+            pot = balance;
+            emit DebugBalance("pot rebalanced", balance, pot);
+        }
+    }
+
+	// Add a function to check contract's real balance
+    function getActualBalance() public view returns (uint256) {
+        return address(this).balance;
+    }
+
+	// Add a function to check ETH flow for prompts
+    function _handlePromptFees(uint256 totalAmount) internal returns (uint256) {
+        uint256 devCut = (totalAmount * DEV_FEE_PERCENT) / 100;
+        uint256 leftover = totalAmount - devCut;
+        
+        emit FundsTracking("fees-start", totalAmount, pot, address(this).balance);
+
+        (bool success, bytes memory data) = payable(owner).call{value: devCut}("");
+        if (!success) {
+            if (data.length > 0) {
+                assembly {
+                    revert(add(32, data), mload(data))
+                }
+            } else {
+                revert("Dev fee transfer failed");
+            }
+        }
+
+        _syncPotWithBalance();
+        pot += leftover;
+
+        emit FundsTracking("fees-end", leftover, pot, address(this).balance);
+        return leftover;
+    }
+
+	// Add new function to sync pot with actual balance
+    function _syncPotWithBalance() internal {
+        uint256 currentBalance = address(this).balance;
+        if (pot > currentBalance) {
+            pot = currentBalance;
+            emit DebugBalance("pot synced", currentBalance, pot);
+        }
+    }
 }

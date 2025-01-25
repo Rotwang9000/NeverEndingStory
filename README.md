@@ -6,16 +6,17 @@ This project is an **unstoppable** decentralised application (dApp) that generat
 
 1. [Overview](#overview)  
 2. [Main Features](#main-features)  
-3. [Smart Contract Flow](#smart-contract-flow)  
-4. [Fees & Pot Distribution](#fees--pot-distribution)  
-5. [Inactivity & Pause Logic](#inactivity--pause-logic)  
-6. [Shout-Out Message Board](#shout-out-message-board)  
-7. [Server / Off-Chain AI Video Generation](#server--off-chain-ai-video-generation)  
-8. [Installation & Deployment](#installation--deployment)  
-9. [Frontend Integration](#frontend-integration)  
-10. [Potential Extensions](#potential-extensions)  
-11. [Example Contract Code](#example-contract-code)  
-12. [Licence](#licence)
+3. [Newer Features](#newer-features)  
+4. [Smart Contract Flow](#smart-contract-flow)  
+5. [Fees & Pot Distribution](#fees--pot-distribution)  
+6. [Inactivity & Pause Logic](#inactivity--pause-logic)  
+7. [Shout-Out Message Board](#shout-out-message-board)  
+8. [Server / Off-Chain AI Video Generation](#server--off-chain-ai-video-generation)  
+9. [Installation & Deployment](#installation--deployment)  
+10. [Frontend Integration](#frontend-integration)  
+11. [Potential Extensions](#potential-extensions)  
+12. [Example Contract Code](#example-contract-code)  
+13. [Licence](#licence)
 
 ---
 
@@ -70,6 +71,14 @@ It’s designed so there’s no single point of failure. *Anyone* can call the r
    - The dApp only stores text prompts and handles ETH logic.  
    - Off-chain servers (watching contract events) do the actual AI video generation.  
    - Final videos are served or stitched externally, unaffected by any single front-end’s downtime.
+
+---
+
+## Newer Features
+
+- Optional limit on how many prompts can be submitted during a round.  
+- Optional maximum total ETH allowed for voting each round.  
+- Reentrancy tests and an attacker contract to ensure all functions are protected.
 
 ---
 
